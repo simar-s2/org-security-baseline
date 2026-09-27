@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  org-security-baseline AWS Config recorder. Deployed into every account and
+  region by the config-recorder StackSet (and as a plain stack in the
+  management account). Records all supported resources, global ones (IAM) only
+  in the home region, and delivers to the central log-archive bucket.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: sec
+  BucketName:
+    Type: String
+    Description: Config and GuardDuty bucket in the log-archive account.
+  KmsKeyArn:
+    Type: String
+    Description: Log-archive KMS key.
+  HomeRegion:
+    Type: String
+    Description: The only region that records global resources such as IAM, so they are not recorded (and billed) once per region.
+  RecordingFrequency:
+    Type: String
+    Default: CONTINUOUS
+    AllowedValues: [CONTINUOUS, DAILY]
+    Description: DAILY is cheaper for accounts with frequent changes; Security Hub controls then update once a day.
+
+Conditions:
+  IsHomeRegion: !Equals [!Ref 'AWS::Region', !Ref HomeRegion]
+
+Resources:
+  RecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWS_ConfigRole'
+      Policies:
+        - PolicyName: deliver-to-log-archive
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/config/AWSLogs/${AWS::AccountId}/*'
+                Condition:
+                  StringLike: { 's3:x-amz-acl': bucket-owner-full-control }
+              - Effect: Allow
+                Action: s3:GetBucketAcl
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}'
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref KmsKeyArn
+
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${NamePrefix}-recorder'
+      RoleARN: !GetAtt RecorderRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: !If [IsHomeRegion, true, false]
+      RecordingMode:
+        RecordingFrequency: !Ref RecordingFrequency
+
+  # CloudFormation starts the recorder once the delivery channel exists.
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: ConfigurationRecorder
+    Properties:
+      Name: !Sub '${NamePrefix}-delivery'
+      S3BucketName: !Ref BucketName
+      S3KeyPrefix: config
+      S3KmsKeyArn: !Ref KmsKeyArn
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
